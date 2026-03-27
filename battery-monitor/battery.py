@@ -57,12 +57,16 @@ class AnalogPin:
 
 
 class Battery:
+    _V_MIN = 2.50  # lower voltage cutoff (battery off)
+    _V_MAX = 4.20  # upper voltage limit (battery full)
+
     def __init__(
         self,
         max_capacity,
         adc_vref=3.3,
         voltage_scale=1.0,
         avg_samples=10,
+        capacity_discharge_offset=0.0,
         # SPI ADC (Raspberry Pi + external ADC, e.g. MCP3001)
         spi_bus=0,
         spi_device=0,
@@ -75,6 +79,11 @@ class Battery:
         :param adc_vref: ADC reference voltage in V
         :param voltage_scale: Scaling factor for external voltage divider
         :param avg_samples: Number of samples for moving average
+        :param capacity_discharge_offset: Percentage points linearly subtracted from
+            the reported capacity across the usable voltage range. Reduction is 0 at
+            full voltage (4.20 V) and equals capacity_discharge_offset at the lower
+            cutoff (2.50 V), so the display reaches 0 % before the battery cuts off.
+            E.g. capacity_discharge_offset=1.0 subtracts up to 1 % at the low end.
         :param spi_bus: SPI bus for external ADC (ignored when analog_pin is set)
         :param spi_device: SPI chip-select for external ADC (ignored when analog_pin is set)
         :param spi_resolution: Bit resolution of external SPI ADC (ignored when analog_pin is set)
@@ -88,6 +97,7 @@ class Battery:
         self.max_capacity = max_capacity
         self.adc_vref = adc_vref
         self.voltage_scale = voltage_scale
+        self._capacity_discharge_offset = capacity_discharge_offset
 
         self.voltage_samples = deque(maxlen=avg_samples)
         self.filtered_voltage = 0.0
@@ -151,6 +161,11 @@ class Battery:
         voltage = self._update_voltage()
         capacity_mAh = self._voltage_to_capacity_mAh(voltage)
         percent = (capacity_mAh / self.max_capacity) * 100.0
+
+        if self._capacity_discharge_offset:
+            norm = max(0.0, min(1.0, (voltage - self._V_MIN) / (self._V_MAX - self._V_MIN)))
+            percent -= self._capacity_discharge_offset * (1.0 - norm)
+
         return max(0.0, min(100.0, percent))
 
 
@@ -161,6 +176,7 @@ if __name__ == "__main__":
         adc_vref=3.3,
         voltage_scale=2.0,  # adjust for your voltage divider
         avg_samples=10,
+        capacity_discharge_offset=1.0,  # show 0 % before actual cutoff
         spi_bus=0,
         spi_device=0,
         spi_resolution=10,
