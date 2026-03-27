@@ -95,8 +95,9 @@ if __name__ == "__main__":
     ADC_VREF = 3.3
     BATTERY_CAPACITY = 3342  # Panasonic NCR18650GA
 
-    # Example: voltage divider with r1=100k and r2=220k
-    VOLTAGE_SCALE = 1/(220 / (100 + 220))  # = 1.4545
+    # Example: voltage divider with r1=100k and r2=200k
+    # VOLTAGE_SCALE = 1/(200 / (100 + 200))  # 1/(r2 / (r1 + r2))
+    VOLTAGE_SCALE = 2
 
     mcp3001 = MCP3001()
     battery = Battery(

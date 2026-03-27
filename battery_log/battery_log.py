@@ -98,7 +98,8 @@ if __name__ == "__main__":
     BATTERY_CAPACITY = 3342  # Panasonic NCR18650GA
 
     # Example: voltage divider with r1=100k and r2=220k
-    VOLTAGE_SCALE = 1 / (220 / (100 + 220))  # = 1.4545
+    # VOLTAGE_SCALE = 1 / (220 / (100 + 220))  # = 1.4545
+    VOLTAGE_SCALE = 2
 
     LOGFILE = "battery_log_2.csv"
     LOG_INTERVAL = 60  # seconds
