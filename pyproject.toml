@@ -12,3 +12,6 @@ packages = ["battery_monitor"]
 
 [tool.setuptools.package-dir]
 battery_monitor = "battery-monitor"
+
+[tool.setuptools.package-data]
+battery_monitor = ["cell_data/*.csv"]

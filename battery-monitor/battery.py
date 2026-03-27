@@ -1,5 +1,47 @@
+import os
 from collections import deque
 from time import sleep
+
+_CELL_DATA_DIR = os.path.join(os.path.dirname(__file__), "cell_data")
+
+
+def _load_discharge_table(cell_type):
+    """Load a discharge table from a CSV file.
+
+    cell_type can be:
+    - A built-in cell name (e.g. "panasonic_ncr18650ga") — resolved from cell_data/
+    - An absolute or relative path to a CSV file
+
+    Expected CSV columns: voltage_v, consumed_mah
+    Rows must be ordered from highest to lowest voltage.
+    Lines starting with '#' and empty lines are ignored.
+
+    Returns a list of (voltage_v, consumed_mah) tuples sorted descending by voltage.
+    The total cell capacity (mAh) equals the consumed_mah value of the last row.
+    """
+    path = str(cell_type)
+    if not os.path.isabs(path) and os.sep not in path and not path.endswith(".csv"):
+        path = os.path.join(_CELL_DATA_DIR, path + ".csv")
+
+    table = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split(",")
+            if len(parts) < 2:
+                continue
+            try:
+                table.append((float(parts[0]), float(parts[1])))
+            except ValueError:
+                continue  # skip header row if present
+
+    if len(table) < 2:
+        raise ValueError(f"Discharge table in '{path}' must have at least 2 data rows.")
+
+    table.sort(key=lambda x: x[0], reverse=True)  # descending by voltage
+    return table
 
 
 class Adc:
@@ -15,7 +57,6 @@ class Adc:
     """
 
     def __init__(self, bus=0, device=0, resolution=10, max_speed_hz=1_000_000):
-        import os
         import spidev
         dev_path = f"/dev/spidev{bus}.{device}"
         if not os.path.exists(dev_path):
@@ -57,12 +98,9 @@ class AnalogPin:
 
 
 class Battery:
-    _V_MIN = 2.50  # lower voltage cutoff (battery off)
-    _V_MAX = 4.20  # upper voltage limit (battery full)
-
     def __init__(
         self,
-        max_capacity,
+        cell_type,
         adc_vref=3.3,
         voltage_scale=1.0,
         avg_samples=10,
@@ -75,15 +113,16 @@ class Battery:
         analog_pin=None,
     ):
         """
-        :param max_capacity: Maximum battery capacity in mAh
+        :param cell_type: Built-in cell name (e.g. "panasonic_ncr18650ga") or path to
+            a CSV file with columns voltage_v, consumed_mah. The total cell capacity
+            is derived from the highest consumed_mah value in the table.
         :param adc_vref: ADC reference voltage in V
         :param voltage_scale: Scaling factor for external voltage divider
         :param avg_samples: Number of samples for moving average
         :param capacity_discharge_offset: Percentage points linearly subtracted from
             the reported capacity across the usable voltage range. Reduction is 0 at
-            full voltage (4.20 V) and equals capacity_discharge_offset at the lower
-            cutoff (2.50 V), so the display reaches 0 % before the battery cuts off.
-            E.g. capacity_discharge_offset=1.0 subtracts up to 1 % at the low end.
+            full voltage and equals capacity_discharge_offset at the lower cutoff,
+            so the display reaches 0 % before the battery cuts off.
         :param spi_bus: SPI bus for external ADC (ignored when analog_pin is set)
         :param spi_device: SPI chip-select for external ADC (ignored when analog_pin is set)
         :param spi_resolution: Bit resolution of external SPI ADC (ignored when analog_pin is set)
@@ -94,7 +133,11 @@ class Battery:
         else:
             self.adc = Adc(bus=spi_bus, device=spi_device, resolution=spi_resolution)
 
-        self.max_capacity = max_capacity
+        self._discharge_table = _load_discharge_table(cell_type)
+        self._v_max = self._discharge_table[0][0]
+        self._v_min = self._discharge_table[-1][0]
+        self._max_capacity = max(consumed for _, consumed in self._discharge_table)
+
         self.adc_vref = adc_vref
         self.voltage_scale = voltage_scale
         self._capacity_discharge_offset = capacity_discharge_offset
@@ -103,80 +146,83 @@ class Battery:
         self.filtered_voltage = 0.0
 
     def _read_voltage(self):
-        """
-        Read battery voltage from ADC, apply reference voltage
-        and external scaling factor (e.g. voltage divider).
-        """
-        adc_voltage = self.adc.value * self.adc_vref
-        return adc_voltage * self.voltage_scale
+        """Read battery voltage from ADC and apply voltage divider scaling."""
+        return self.adc.value * self.adc_vref * self.voltage_scale
 
     def _update_voltage(self):
-        """Calculate moving average of recent voltage measurements."""
+        """Update and return the moving average of recent voltage measurements."""
         voltage = self._read_voltage()
         self.voltage_samples.append(voltage)
         self.filtered_voltage = sum(self.voltage_samples) / len(self.voltage_samples)
         return self.filtered_voltage
 
-    def _voltage_to_capacity_mAh(self, voltage):
-        """
-        Map battery voltage to remaining capacity in mAh
-        using NCR18650GA discharge curve under load.
-        """
-        table = [
-            (4.20, max(self.max_capacity, 3332)),
-            (4.07, 3332),
-            (4.02, 3292),
-            (3.97, 3042),
-            (3.93, 2842),
-            (3.77, 2342),
-            (3.50, 1342),
-            (3.36, 742),
-            (3.29, 542),
-            (3.24, 442),
-            (3.17, 342),
-            (3.00, 205),
-            (2.80, 102),
-            (2.50, 0),
-        ]
-
-        if voltage >= 4.20:
-            return max(self.max_capacity, 3332)
-        if voltage <= 2.50:
+    def _voltage_to_capacity_pct(self, voltage):
+        """Interpolate remaining capacity in percent from the discharge table."""
+        if voltage >= self._v_max:
+            return 100.0
+        if voltage <= self._v_min:
             return 0.0
 
+        table = self._discharge_table
         for i in range(len(table) - 1):
-            v_high, c_high = table[i]
-            v_low, c_low = table[i + 1]
+            v_high, consumed_high = table[i]
+            v_low, consumed_low = table[i + 1]
             if v_low <= voltage <= v_high:
-                slope = (c_high - c_low) / (v_high - v_low)
-                return c_low + slope * (voltage - v_low)
+                # linear interpolation of consumed_mah between the two points
+                consumed = consumed_high + (consumed_low - consumed_high) * \
+                           (v_high - voltage) / (v_high - v_low)
+                return (1.0 - consumed / self._max_capacity) * 100.0
 
         return 0.0
 
-    def get_capacity(self):
-        """
-        Return remaining battery capacity in percent
-        (based on moving averaged voltage).
+    def _pct_from_voltage(self, voltage, disable_cap_discharge_offset=False):
+        """Compute capacity % from voltage, optionally applying the discharge offset."""
+        pct = self._voltage_to_capacity_pct(voltage)
+        if self._capacity_discharge_offset and not disable_cap_discharge_offset:
+            norm = max(0.0, min(1.0, (voltage - self._v_min) / (self._v_max - self._v_min)))
+            pct -= self._capacity_discharge_offset * (1.0 - norm)
+        return max(0.0, min(100.0, pct))
+
+    def get_voltage(self, disable_cap_discharge_offset=False):
+        """Return the current battery voltage in V (moving averaged)."""
+        return self._update_voltage()
+
+    def get_capacity_percentage(self, disable_cap_discharge_offset=False):
+        """Return remaining battery capacity in % (moving averaged voltage)."""
+        return self._pct_from_voltage(self._update_voltage(), disable_cap_discharge_offset)
+
+    def get_capacity(self, disable_cap_discharge_offset=False):
+        """Return remaining battery capacity in mAh (moving averaged voltage)."""
+        pct = self._pct_from_voltage(self._update_voltage(), disable_cap_discharge_offset)
+        return round(self._max_capacity * pct / 100.0, 1)
+
+    def get_status(self, disable_cap_discharge_offset=False):
+        """Return all battery values as a dict.
+
+        Returns:
+            {
+                "voltage_v":       float  — measured voltage in V,
+                "capacity_mah":    float  — remaining capacity in mAh,
+                "capacity_pct":    float  — remaining capacity in %,
+            }
         """
         voltage = self._update_voltage()
-        capacity_mAh = self._voltage_to_capacity_mAh(voltage)
-        percent = (capacity_mAh / self.max_capacity) * 100.0
-
-        if self._capacity_discharge_offset:
-            norm = max(0.0, min(1.0, (voltage - self._V_MIN) / (self._V_MAX - self._V_MIN)))
-            percent -= self._capacity_discharge_offset * (1.0 - norm)
-
-        return max(0.0, min(100.0, percent))
+        pct = self._pct_from_voltage(voltage, disable_cap_discharge_offset)
+        return {
+            "voltage_v":    round(voltage, 3),
+            "capacity_mah": round(self._max_capacity * pct / 100.0, 1),
+            "capacity_pct": round(pct, 1),
+        }
 
 
 if __name__ == "__main__":
     # Raspberry Pi example (MCP3001 via SPI):
     battery = Battery(
-        max_capacity=3342,  # Panasonic NCR18650GA (mAh)
+        cell_type="panasonic_ncr18650ga",
         adc_vref=3.3,
-        voltage_scale=2.0,  # adjust for your voltage divider
+        voltage_scale=2.0,       # adjust for your voltage divider
         avg_samples=10,
-        capacity_discharge_offset=1.0,  # show 0 % before actual cutoff
+        capacity_discharge_offset=1.0,
         spi_bus=0,
         spi_device=0,
         spi_resolution=10,
@@ -184,7 +230,7 @@ if __name__ == "__main__":
 
     # ESP32 example (native analog pin):
     # battery = Battery(
-    #     max_capacity=3342,
+    #     cell_type="panasonic_ncr18650ga",
     #     adc_vref=3.3,
     #     voltage_scale=2.0,
     #     avg_samples=10,
@@ -192,6 +238,8 @@ if __name__ == "__main__":
     # )
 
     while True:
-        capacity = battery.get_capacity()
-        print(f"Voltage: {battery.filtered_voltage:.3f} V | Capacity: {capacity:.1f} %")
+        status = battery.get_status()
+        print(f"Voltage: {status['voltage_v']:.3f} V | "
+              f"{status['capacity_mah']:.0f} mAh | "
+              f"{status['capacity_pct']:.1f} %")
         sleep(1)

@@ -1,0 +1,19 @@
+# Panasonic NCR18650GA — discharge curve
+# Chemistry: NCA  |  Nominal capacity: 3350 mAh  |  Voltage range: 2.50–4.20 V
+# Source: derived from Panasonic NCR18650GA datasheet discharge curve
+#
+# voltage_v,consumed_mah
+4.20,0
+4.07,10
+4.02,50
+3.97,300
+3.93,500
+3.77,1000
+3.50,2000
+3.36,2600
+3.29,2800
+3.24,2900
+3.17,3000
+3.00,3137
+2.80,3240
+2.50,3342
