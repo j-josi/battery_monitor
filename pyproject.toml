@@ -6,3 +6,9 @@ build-backend = "setuptools.build_meta"
 name = "battery-monitor"
 version = "0.1.0"
 dependencies = ["gpiozero"]
+
+[tool.setuptools]
+packages = ["battery_monitor"]
+
+[tool.setuptools.package-dir]
+battery_monitor = "battery-monitor"
