@@ -1,8 +1,37 @@
-from collections import deque
-from time import sleep, time
-from gpiozero import MCP3001
+#!/usr/bin/env python3
+"""Battery discharge logger — records voltage and capacity over time to a CSV file.
+
+Purpose:
+    Runs during a controlled battery discharge test and logs voltage, capacity,
+    and elapsed runtime at a fixed interval. The resulting CSV can be used to
+    analyse battery performance, validate discharge curves, or generate new cell
+    profiles for the battery_monitor module.
+
+Usage:
+    python scripts/battery_discharge_logger.py
+
+Output CSV format (battery_log_2.csv):
+    runtime_minutes, voltage_V, capacity_percent
+
+    runtime_minutes  — elapsed time since script start
+    voltage_V        — measured battery voltage (moving averaged)
+    capacity_percent — estimated remaining capacity
+
+Configure LOGFILE, LOG_INTERVAL, BATTERY_CAPACITY, and VOLTAGE_SCALE at the
+top of the __main__ block before running.
+"""
+
 import csv
 import os
+import sys
+from collections import deque
+from time import sleep, time
+
+# Add repo root to path so battery_monitor package is importable
+# regardless of the working directory the script is called from.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from gpiozero import MCP3001
 
 
 class Battery:

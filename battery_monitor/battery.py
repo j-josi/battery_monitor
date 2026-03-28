@@ -105,6 +105,7 @@ class Battery:
         voltage_scale=1.0,
         avg_samples=10,
         capacity_discharge_offset=0.0,
+        full_runtime_min=None,
         # SPI ADC (Raspberry Pi + external ADC, e.g. MCP3001)
         spi_bus=0,
         spi_device=0,
@@ -123,6 +124,9 @@ class Battery:
             the reported capacity across the usable voltage range. Reduction is 0 at
             full voltage and equals capacity_discharge_offset at the lower cutoff,
             so the display reaches 0 % before the battery cuts off.
+        :param full_runtime_min: Estimated runtime in minutes at 100 % capacity.
+            When set, get_runtime_min() and get_status() return a proportional
+            runtime estimate. If None, runtime is not estimated (returns None).
         :param spi_bus: SPI bus for external ADC (ignored when analog_pin is set)
         :param spi_device: SPI chip-select for external ADC (ignored when analog_pin is set)
         :param spi_resolution: Bit resolution of external SPI ADC (ignored when analog_pin is set)
@@ -141,23 +145,22 @@ class Battery:
         self.adc_vref = adc_vref
         self.voltage_scale = voltage_scale
         self._capacity_discharge_offset = capacity_discharge_offset
+        self._full_runtime_min = full_runtime_min
 
         self.voltage_samples = deque(maxlen=avg_samples)
-        self.filtered_voltage = 0.0
+
+        # Current state — populated by update()
+        self.voltage_v            = None
+        self.state_of_charge_pct  = None
+        self.state_of_charge_mah  = None
+        self.runtime_remaining    = None
 
     def _read_voltage(self):
         """Read battery voltage from ADC and apply voltage divider scaling."""
         return self.adc.value * self.adc_vref * self.voltage_scale
 
-    def _update_voltage(self):
-        """Update and return the moving average of recent voltage measurements."""
-        voltage = self._read_voltage()
-        self.voltage_samples.append(voltage)
-        self.filtered_voltage = sum(self.voltage_samples) / len(self.voltage_samples)
-        return self.filtered_voltage
-
-    def _voltage_to_capacity_pct(self, voltage):
-        """Interpolate remaining capacity in percent from the discharge table."""
+    def _voltage_to_soc_pct(self, voltage):
+        """Interpolate state of charge in percent from the discharge table."""
         if voltage >= self._v_max:
             return 100.0
         if voltage <= self._v_min:
@@ -168,50 +171,81 @@ class Battery:
             v_high, consumed_high = table[i]
             v_low, consumed_low = table[i + 1]
             if v_low <= voltage <= v_high:
-                # linear interpolation of consumed_mah between the two points
                 consumed = consumed_high + (consumed_low - consumed_high) * \
                            (v_high - voltage) / (v_high - v_low)
                 return (1.0 - consumed / self._max_capacity) * 100.0
 
         return 0.0
 
-    def _pct_from_voltage(self, voltage, disable_cap_discharge_offset=False):
-        """Compute capacity % from voltage, optionally applying the discharge offset."""
-        pct = self._voltage_to_capacity_pct(voltage)
+    def update(self, disable_cap_discharge_offset=False):
+        """Read voltage once and compute all derived values.
+
+        Stores results in voltage_v, state_of_charge_pct, state_of_charge_mah
+        and runtime_remaining. Returns True if any value changed, False otherwise.
+        """
+        raw = self._read_voltage()
+        self.voltage_samples.append(raw)
+        voltage = sum(self.voltage_samples) / len(self.voltage_samples)
+
+        pct = self._voltage_to_soc_pct(voltage)
         if self._capacity_discharge_offset and not disable_cap_discharge_offset:
             norm = max(0.0, min(1.0, (voltage - self._v_min) / (self._v_max - self._v_min)))
             pct -= self._capacity_discharge_offset * (1.0 - norm)
-        return max(0.0, min(100.0, pct))
+        pct = max(0.0, min(100.0, pct))
 
-    def get_voltage(self, disable_cap_discharge_offset=False):
-        """Return the current battery voltage in V (moving averaged)."""
-        return self._update_voltage()
+        new_voltage_v           = round(voltage, 3)
+        new_soc_pct             = round(pct, 1)
+        new_soc_mah             = round(self._max_capacity * pct / 100.0, 1)
+        new_runtime_remaining   = round(self._full_runtime_min * pct / 100.0, 1) \
+                                  if self._full_runtime_min is not None else None
 
-    def get_capacity_percentage(self, disable_cap_discharge_offset=False):
-        """Return remaining battery capacity in % (moving averaged voltage)."""
-        return self._pct_from_voltage(self._update_voltage(), disable_cap_discharge_offset)
+        changed = (
+            new_voltage_v         != self.voltage_v           or
+            new_soc_pct           != self.state_of_charge_pct or
+            new_soc_mah           != self.state_of_charge_mah or
+            new_runtime_remaining != self.runtime_remaining
+        )
 
-    def get_capacity(self, disable_cap_discharge_offset=False):
-        """Return remaining battery capacity in mAh (moving averaged voltage)."""
-        pct = self._pct_from_voltage(self._update_voltage(), disable_cap_discharge_offset)
-        return round(self._max_capacity * pct / 100.0, 1)
+        self.voltage_v           = new_voltage_v
+        self.state_of_charge_pct = new_soc_pct
+        self.state_of_charge_mah = new_soc_mah
+        self.runtime_remaining   = new_runtime_remaining
 
-    def get_status(self, disable_cap_discharge_offset=False):
-        """Return all battery values as a dict.
+        return changed
+
+    def get_voltage(self):
+        """Return the last measured battery voltage in V."""
+        return self.voltage_v
+
+    def get_state_of_charge_pct(self):
+        """Return the last computed state of charge in %."""
+        return self.state_of_charge_pct
+
+    def get_state_of_charge_mah(self):
+        """Return the last computed state of charge in mAh."""
+        return self.state_of_charge_mah
+
+    def get_runtime_remaining(self):
+        """Return the last computed estimated remaining runtime in minutes, or None."""
+        return self.runtime_remaining
+
+    def get_status(self):
+        """Return all current battery values as a dict.
 
         Returns:
             {
-                "voltage_v":       float  — measured voltage in V,
-                "capacity_mah":    float  — remaining capacity in mAh,
-                "capacity_pct":    float  — remaining capacity in %,
+                "voltage_v":           float        — last measured voltage in V,
+                "state_of_charge_mah": float        — last computed state of charge in mAh,
+                "state_of_charge_pct": float        — last computed state of charge in %,
+                "runtime_remaining":   float | None — last computed remaining runtime in minutes,
+                                                      None if full_runtime_min was not set.
             }
         """
-        voltage = self._update_voltage()
-        pct = self._pct_from_voltage(voltage, disable_cap_discharge_offset)
         return {
-            "voltage_v":    round(voltage, 3),
-            "capacity_mah": round(self._max_capacity * pct / 100.0, 1),
-            "capacity_pct": round(pct, 1),
+            "voltage_v":           self.voltage_v,
+            "state_of_charge_mah": self.state_of_charge_mah,
+            "state_of_charge_pct": self.state_of_charge_pct,
+            "runtime_remaining":   self.runtime_remaining,
         }
 
 
@@ -238,8 +272,9 @@ if __name__ == "__main__":
     # )
 
     while True:
+        battery.update()
         status = battery.get_status()
         print(f"Voltage: {status['voltage_v']:.3f} V | "
-              f"{status['capacity_mah']:.0f} mAh | "
-              f"{status['capacity_pct']:.1f} %")
+              f"{status['state_of_charge_mah']:.0f} mAh | "
+              f"{status['state_of_charge_pct']:.1f} %")
         sleep(1)
